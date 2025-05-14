@@ -1,7 +1,4 @@
-// Copyright (c) 2017, Daniel Martí <mvdan@mvdan.cc>
-// See LICENSE for licensing information
-
-package interp
+package vsh
 
 import (
 	"context"
@@ -9,48 +6,37 @@ import (
 	"os"
 	"regexp"
 
-	"golang.org/x/term"
-
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
 )
 
 // non-empty string is true, empty string is false
-func (r *Runner) bashTest(ctx context.Context, expr syntax.TestExpr, classic bool) string {
+func (r *Runner) shTest(ctx context.Context, expr syntax.TestExpr) string {
 	switch x := expr.(type) {
 	case *syntax.Word:
-		if classic {
-			// In the classic "test" mode, we already expanded and
-			// split the list of words, so don't redo that work.
-			return r.document(x)
-		}
-		return r.literal(x)
+		// In the classic "test" mode, we already expanded and
+		// split the list of words, so don't redo that work.
+		return r.document(x)
 	case *syntax.ParenTest:
-		return r.bashTest(ctx, x.X, classic)
+		return r.shTest(ctx, x.X)
 	case *syntax.BinaryTest:
 		switch x.Op {
 		case syntax.TsMatchShort, syntax.TsMatch, syntax.TsNoMatch:
 			str := r.literal(x.X.(*syntax.Word))
 			yw := x.Y.(*syntax.Word)
-			if classic { // test, [
-				lit := r.literal(yw)
-				if (str == lit) == (x.Op != syntax.TsNoMatch) {
-					return "1"
-				}
-			} else { // [[
-				pattern := r.pattern(yw)
-				if match(pattern, str) == (x.Op != syntax.TsNoMatch) {
-					return "1"
-				}
+			// test, [
+			lit := r.literal(yw)
+			if (str == lit) == (x.Op != syntax.TsNoMatch) {
+				return "1"
 			}
 			return ""
 		}
-		if r.binTest(ctx, x.Op, r.bashTest(ctx, x.X, classic), r.bashTest(ctx, x.Y, classic)) {
+		if r.binTest(ctx, x.Op, r.shTest(ctx, x.X), r.shTest(ctx, x.Y)) {
 			return "1"
 		}
 		return ""
 	case *syntax.UnaryTest:
-		if r.unTest(ctx, x.Op, r.bashTest(ctx, x.X, classic)) {
+		if r.unTest(ctx, x.Op, r.shTest(ctx, x.X)) {
 			return "1"
 		}
 		return ""
@@ -166,38 +152,22 @@ func (r *Runner) unTest(ctx context.Context, op syntax.UnTestOperator, x string)
 	// case syntax.TsUsrOwn:
 	// case syntax.TsModif:
 	case syntax.TsRead:
-		return r.access(ctx, r.absPath(x), access_R_OK) == nil
+		return r.statMode(ctx, x, access_R_OK)
 	case syntax.TsWrite:
-		return r.access(ctx, r.absPath(x), access_W_OK) == nil
+		return r.statMode(ctx, x, access_W_OK)
 	case syntax.TsExec:
-		return r.access(ctx, r.absPath(x), access_X_OK) == nil
+		return r.statMode(ctx, x, access_X_OK)
 	case syntax.TsNoEmpty:
 		info, err := r.stat(ctx, x)
 		return err == nil && info.Size() > 0
 	case syntax.TsFdTerm:
-		fd := atoi(x)
-		var f any
-		switch fd {
-		case 0:
-			f = r.stdin
-		case 1:
-			f = r.stdout
-		case 2:
-			f = r.stderr
-		}
-		if f, ok := f.(interface{ Fd() uintptr }); ok {
-			// Support [os.File.Fd] methods such as the one on [*os.File].
-			return term.IsTerminal(int(f.Fd()))
-		}
-		// TODO: allow term.IsTerminal here too if running in the
-		// "single process" mode.
-		return false
+		return r.TTY
 	case syntax.TsEmpStr:
 		return x == ""
 	case syntax.TsNempStr:
 		return x != ""
 	case syntax.TsOptSet:
-		if _, opt := r.optByName(x, false); opt != nil {
+		if _, opt := r.optByName(x); opt != nil {
 			return *opt
 		}
 		return false
@@ -207,8 +177,6 @@ func (r *Runner) unTest(ctx context.Context, op syntax.UnTestOperator, x string)
 		return r.lookupVar(x).Kind == expand.NameRef
 	case syntax.TsNot:
 		return x == ""
-	case syntax.TsUsrOwn, syntax.TsGrpOwn:
-		return r.unTestOwnOrGrp(ctx, op, x)
 	default:
 		panic(fmt.Sprintf("unhandled unary test op: %v", op))
 	}

@@ -1,7 +1,4 @@
-// Copyright (c) 2017, Daniel Martí <mvdan@mvdan.cc>
-// See LICENSE for licensing information
-
-package interp
+package vsh
 
 import (
 	"bufio"
@@ -9,16 +6,11 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
+	filepath "path"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/term"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
@@ -26,7 +18,7 @@ import (
 
 func isBuiltin(name string) bool {
 	switch name {
-	case "true", ":", "false", "exit", "set", "shift", "unset",
+	case "true", "false", "exit", "set", "shift", "unset",
 		"echo", "printf", "break", "continue", "pwd", "cd",
 		"wait", "builtin", "trap", "type", "source", ".", "command",
 		"dirs", "pushd", "popd", "umask", "alias", "unalias",
@@ -36,8 +28,6 @@ func isBuiltin(name string) bool {
 	}
 	return false
 }
-
-// TODO: oneIf and atoi are duplicated in the expand package.
 
 func oneIf(b bool) int {
 	if b {
@@ -55,7 +45,7 @@ func atoi(s string) int {
 
 func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, args []string) int {
 	switch name {
-	case "true", ":":
+	case "true":
 	case "false":
 		return 1
 	case "exit":
@@ -77,7 +67,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 		r.exitShell(ctx, exit)
 		return exit
 	case "set":
-		if err := Params(args...)(r); err != nil {
+		if err := WithParams(args...)(r); err != nil {
 			r.errf("set: %v\n", err)
 			return 2
 		}
@@ -192,28 +182,10 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			return 2
 		}
 	case "pwd":
-		evalSymlinks := false
 		for len(args) > 0 {
-			switch args[0] {
-			case "-L":
-				evalSymlinks = false
-			case "-P":
-				evalSymlinks = true
-			default:
-				r.errf("invalid option: %q\n", args[0])
-				return 2
-			}
-			args = args[1:]
+			r.errf("invalid option: %q\n", args[0])
 		}
 		pwd := r.envGet("PWD")
-		if evalSymlinks {
-			var err error
-			pwd, err = filepath.EvalSymlinks(pwd)
-			if err != nil {
-				r.setFatalErr(err) // perhaps overly dramatic?
-				return 1
-			}
-		}
 		r.outf("%s\n", pwd)
 	case "cd":
 		var path string
@@ -295,7 +267,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 		args := fp.args()
 		for _, arg := range args {
 			if mode == "-p" {
-				if path, err := LookPathDir(r.Dir, r.writeEnv, arg); err == nil {
+				if path, err := lookPathDir(r.Dir, r.writeEnv, arg); err == nil {
 					r.outf("%s\n", path)
 				} else {
 					anyNotFound = true
@@ -310,24 +282,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 				}
 				continue
 			}
-			if als, ok := r.alias[arg]; ok && r.opts[optExpandAliases] {
-				var buf bytes.Buffer
-				if len(als.args) > 0 {
-					printer := syntax.NewPrinter()
-					printer.Print(&buf, &syntax.CallExpr{
-						Args: als.args,
-					})
-				}
-				if als.blank {
-					buf.WriteByte(' ')
-				}
-				if mode == "-t" {
-					r.out("alias\n")
-				} else {
-					r.outf("%s is aliased to `%s'\n", arg, &buf)
-				}
-				continue
-			}
+
 			if _, ok := r.Funcs[arg]; ok {
 				if mode == "-t" {
 					r.out("function\n")
@@ -344,7 +299,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 				}
 				continue
 			}
-			if path, err := LookPathDir(r.Dir, r.writeEnv, arg); err == nil {
+			if path, err := lookPathDir(r.Dir, r.writeEnv, arg); err == nil {
 				if mode == "-t" {
 					r.out("file\n")
 				} else {
@@ -375,7 +330,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			r.errf("%v: source: need filename\n", pos)
 			return 2
 		}
-		path, err := scriptFromPathDir(r.Dir, r.writeEnv, args[0])
+		path, err := lookPathDir(r.Dir, r.writeEnv, args[0])
 		if err != nil {
 			// If the script was not found in PATH or there was any error, pass
 			// the source path to the open handler so it has a chance to look
@@ -383,7 +338,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			// it to look for the sourced script in the current directory.
 			path = args[0]
 		}
-		f, err := r.open(ctx, path, os.O_RDONLY, 0, false)
+		f, err := r.open(ctx, path)
 		if err != nil {
 			r.errf("source: %v\n", err)
 			return 1
@@ -445,7 +400,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 		if parseErr {
 			return 2
 		}
-		return oneIf(r.bashTest(ctx, expr, true) == "")
+		return oneIf(r.shTest(ctx, expr) == "")
 	case "exec":
 		// TODO: Consider unix.Exec, i.e. actually replacing
 		// the process. It's in theory what a shell should do,
@@ -486,7 +441,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			last = 0
 			if r.Funcs[arg] != nil || isBuiltin(arg) {
 				r.outf("%s\n", arg)
-			} else if path, err := LookPathDir(r.Dir, r.writeEnv, arg); err == nil {
+			} else if path, err := lookPathDir(r.Dir, r.writeEnv, arg); err == nil {
 				r.outf("%s\n", path)
 			} else {
 				last = 1
@@ -589,12 +544,12 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 	case "read":
 		var prompt string
 		raw := false
-		silent := false
 		fp := flagParser{remaining: args}
 		for fp.more() {
 			switch flag := fp.flag(); flag {
 			case "-s":
-				silent = true
+				r.errf("read: -s: unsupport yet\n")
+				return 2
 			case "-r":
 				raw = true
 			case "-p":
@@ -621,14 +576,7 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 			r.out(prompt)
 		}
 
-		var line []byte
-		var err error
-		if silent {
-			// Note that on Windows, syscall.Stdin is of type uintptr.
-			line, err = term.ReadPassword(int(syscall.Stdin))
-		} else {
-			line, err = r.readLine(ctx, raw)
-		}
+		line, err := r.readLine(ctx, raw)
 		if len(args) == 0 {
 			args = append(args, shellReplyVar)
 		}
@@ -696,60 +644,35 @@ func (r *Runner) builtinCode(ctx context.Context, pos syntax.Pos, name string, a
 
 	case "shopt":
 		mode := ""
-		posixOpts := false
 		fp := flagParser{remaining: args}
 		for fp.more() {
 			switch flag := fp.flag(); flag {
-			case "-s", "-u":
+			case "-s":
 				mode = flag
-			case "-o":
-				posixOpts = true
-			case "-p", "-q":
-				panic(fmt.Sprintf("unhandled shopt flag: %s", flag))
 			default:
 				r.errf("shopt: invalid option %q\n", flag)
 				return 2
 			}
 		}
 		args := fp.args()
-		bash := !posixOpts
 		if len(args) == 0 {
-			if bash {
-				for i, opt := range bashOptsTable {
-					r.printOptLine(opt.name, r.opts[len(shellOptsTable)+i], opt.supported)
-				}
-				break
-			}
 			for i, opt := range &shellOptsTable {
 				r.printOptLine(opt.name, r.opts[i], true)
 			}
 			break
 		}
 		for _, arg := range args {
-			i, opt := r.optByName(arg, bash)
+			_, opt := r.optByName(arg)
 			if opt == nil {
 				r.errf("shopt: invalid option name %q\n", arg)
 				return 1
 			}
 
-			var (
-				bo        *bashOpt
-				supported = true // default for shell options
-			)
-			if bash {
-				bo = &bashOptsTable[i-len(shellOptsTable)]
-				supported = bo.supported
-			}
-
 			switch mode {
-			case "-s", "-u":
-				if bash && !supported {
-					r.errf("shopt: invalid option name %q %q (%q not supported)\n", arg, r.optStatusText(bo.defaultState), r.optStatusText(!bo.defaultState))
-					return 1
-				}
-				*opt = mode == "-s"
+			case "-s":
+				*opt = true
 			default: // ""
-				r.printOptLine(arg, *opt, supported)
+				r.printOptLine(arg, *opt, true)
 			}
 		}
 		r.updateExpandOpts()
@@ -949,18 +872,26 @@ func mapfileSplit(delim byte, dropDelim bool) bufio.SplitFunc {
 	}
 }
 
+// optStatusText returns a shell option's status text display
+func optStatusText(status bool) string {
+	if status {
+		return "on"
+	}
+	return "off"
+}
+
 func (r *Runner) printOptLine(name string, enabled, supported bool) {
-	state := r.optStatusText(enabled)
+	state := optStatusText(enabled)
 	if supported {
 		r.outf("%s\t%s\n", name, state)
 		return
 	}
-	r.outf("%s\t%s\t(%q not supported)\n", name, state, r.optStatusText(!enabled))
+	r.outf("%s\t%s\t(%q not supported)\n", name, state, optStatusText(!enabled))
 }
 
 func (r *Runner) readLine(ctx context.Context, raw bool) ([]byte, error) {
 	if r.stdin == nil {
-		return nil, errors.New("interp: can't read, there's no stdin")
+		return nil, errors.New("vsh: can't read, there's no stdin")
 	}
 
 	var line []byte
@@ -1009,10 +940,18 @@ func (r *Runner) changeDir(ctx context.Context, path string) int {
 	path = cmp.Or(path, ".")
 	path = r.absPath(path)
 	info, err := r.stat(ctx, path)
-	if err != nil || !info.IsDir() {
+	if err != nil {
+		r.errf("cd: %s: %v\n", path, err)
 		return 1
 	}
-	if r.access(ctx, path, access_X_OK) != nil {
+
+	if !info.IsDir() {
+		r.errf("%s is not a directory\n", path)
+		return 1
+	}
+
+	if !r.statMode(ctx, path, access_X_OK) {
+		r.errf("permission denied: %s\n", path)
 		return 1
 	}
 	r.Dir = path
@@ -1021,18 +960,14 @@ func (r *Runner) changeDir(ctx context.Context, path string) int {
 	return 0
 }
 
-func absPath(dir, path string) string {
+func (r *Runner) absPath(path string) string {
 	if path == "" {
 		return ""
 	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(dir, path)
+		path = filepath.Join(r.Dir, path)
 	}
-	return filepath.Clean(path) // TODO: this clean is likely unnecessary
-}
-
-func (r *Runner) absPath(path string) string {
-	return absPath(r.Dir, path)
+	return filepath.Clean(path)
 }
 
 // flagParser is used to parse builtin flags.
@@ -1137,12 +1072,4 @@ func (g *getopts) next(optstr string, args []string) (opt rune, optarg string, d
 	}
 
 	return opt, optarg, false
-}
-
-// optStatusText returns a shell option's status text display
-func (r *Runner) optStatusText(status bool) string {
-	if status {
-		return "on"
-	}
-	return "off"
 }

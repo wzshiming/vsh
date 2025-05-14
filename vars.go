@@ -1,16 +1,11 @@
-// Copyright (c) 2017, Daniel Martí <mvdan@mvdan.cc>
-// See LICENSE for licensing information
-
-package interp
+package vsh
 
 import (
 	"fmt"
 	"maps"
 	"os"
-	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/syntax"
@@ -99,28 +94,6 @@ func (o *overlayEnviron) Each(f func(name string, vr expand.Variable) bool) {
 	}
 }
 
-func execEnv(env expand.Environ) []string {
-	list := make([]string, 0, 64)
-	for name, vr := range env.Each {
-		if !vr.IsSet() {
-			// If a variable is set globally but unset in the
-			// runner, we need to ensure it's not part of the final
-			// list. Seems like zeroing the element is enough.
-			// This is a linear search, but this scenario should be
-			// rare, and the number of variables shouldn't be large.
-			for i, kv := range list {
-				if strings.HasPrefix(kv, name+"=") {
-					list[i] = ""
-				}
-			}
-		}
-		if vr.Exported && vr.Kind == expand.String {
-			list = append(list, name+"="+vr.String())
-		}
-	}
-	return list
-}
-
 func (r *Runner) lookupVar(name string) expand.Variable {
 	if name == "" {
 		panic("variable name must not be empty")
@@ -154,7 +127,7 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 		if r.filename != "" {
 			vr.Str = r.filename
 		} else {
-			vr.Str = "gosh"
+			vr.Str = "sh"
 		}
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 		vr.Kind = expand.String
@@ -171,12 +144,6 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 	}
 	if vr := r.writeEnv.Get(name); vr.Declared() {
 		return vr
-	}
-	if runtime.GOOS == "windows" {
-		upper := strings.ToUpper(name)
-		if vr := r.writeEnv.Get(upper); vr.Declared() {
-			return vr
-		}
 	}
 	return expand.Variable{}
 }

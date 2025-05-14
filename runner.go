@@ -1,7 +1,4 @@
-// Copyright (c) 2017, Daniel Martí <mvdan@mvdan.cc>
-// See LICENSE for licensing information
-
-package interp
+package vsh
 
 import (
 	"bytes"
@@ -9,19 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	iofs "io/fs"
 	"iter"
 	"math"
-	"math/rand"
 	"os"
-	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/wzshiming/vsh/fs"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/pattern"
 	"mvdan.cc/sh/v3/syntax"
@@ -36,8 +31,6 @@ const (
 	// shellReplyVar, or REPLY, is a special variable in Bash that is used to store the result of
 	// the select command or of the read command, when no variable name is specified
 	shellReplyVar = "REPLY"
-
-	fifoNamePrefix = "sh-interp-"
 )
 
 func (r *Runner) fillExpandConfig(ctx context.Context) {
@@ -54,7 +47,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 					break
 				}
 				path := r.literal(word)
-				f, err := r.open(ctx, path, os.O_RDONLY, 0, true)
+				f, err := r.open(ctx, path)
 				if err != nil {
 					return err
 				}
@@ -67,84 +60,6 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r2.stmts(ctx, cs.Stmts)
 			r.lastExpandExit = r2.exit
 			return r2.fatalErr
-		},
-		ProcSubst: func(ps *syntax.ProcSubst) (string, error) {
-			if runtime.GOOS == "windows" {
-				return "", fmt.Errorf("TODO: support process substitution on Windows")
-			}
-			if len(ps.Stmts) == 0 { // nothing to do
-				return os.DevNull, nil
-			}
-
-			if r.rand == nil {
-				r.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-			}
-
-			// We can't atomically create a random unused temporary FIFO.
-			// Similar to [os.CreateTemp],
-			// keep trying new random paths until one does not exist.
-			// We use a uint64 because a uint32 easily runs into retries.
-			var path string
-			try := 0
-			for {
-				path = filepath.Join(r.tempDir, fifoNamePrefix+strconv.FormatUint(r.rand.Uint64(), 16))
-				err := mkfifo(path, 0o666)
-				if err == nil {
-					break
-				}
-				if !os.IsExist(err) {
-					return "", fmt.Errorf("cannot create fifo: %v", err)
-				}
-				if try++; try > 100 {
-					return "", fmt.Errorf("giving up at creating fifo: %v", err)
-				}
-			}
-
-			r2 := r.subshell(true)
-			stdout := r.origStdout
-			// TODO: note that `man bash` mentions that `wait` only waits for the last
-			// process substitution as long as it is $!; the logic here would mean we wait for all of them.
-			bg := bgProc{
-				done: make(chan struct{}),
-				exit: new(int),
-			}
-			r.bgProcs = append(r.bgProcs, bg)
-			go func() {
-				defer func() {
-					*bg.exit = r2.exit
-					close(bg.done)
-				}()
-				switch ps.Op {
-				case syntax.CmdIn:
-					f, err := os.OpenFile(path, os.O_WRONLY, 0)
-					if err != nil {
-						r.errf("cannot open fifo for stdout: %v\n", err)
-						return
-					}
-					r2.stdout = f
-					defer func() {
-						if err := f.Close(); err != nil {
-							r.errf("closing stdout fifo: %v\n", err)
-						}
-						os.Remove(path)
-					}()
-				default: // syntax.CmdOut
-					f, err := os.OpenFile(path, os.O_RDONLY, 0)
-					if err != nil {
-						r.errf("cannot open fifo for stdin: %v\n", err)
-						return
-					}
-					r2.stdin = f
-					r2.stdout = stdout
-
-					defer func() {
-						f.Close()
-						os.Remove(path)
-					}()
-				}
-				r2.stmts(ctx, ps.Stmts)
-			}()
-			return path, nil
 		},
 	}
 	r.updateExpandOpts()
@@ -170,13 +85,11 @@ func (r *Runner) updateExpandOpts() {
 	if r.opts[optNoGlob] {
 		r.ecfg.ReadDir2 = nil
 	} else {
-		r.ecfg.ReadDir2 = func(s string) ([]fs.DirEntry, error) {
-			return r.readDirHandler(r.handlerCtx(context.Background()), s)
+		r.ecfg.ReadDir2 = func(s string) ([]iofs.DirEntry, error) {
+			return iofs.ReadDir(r.FileSystem, s)
 		}
 	}
-	r.ecfg.GlobStar = r.opts[optGlobStar]
-	r.ecfg.NoCaseGlob = r.opts[optNoCaseGlob]
-	r.ecfg.NullGlob = r.opts[optNullGlob]
+
 	r.ecfg.NoUnset = r.opts[optNoUnset]
 }
 
@@ -249,19 +162,6 @@ func (e expandEnv) Each(fn func(name string, vr expand.Variable) bool) {
 	e.r.writeEnv.Each(fn)
 }
 
-func (r *Runner) handlerCtx(ctx context.Context) context.Context {
-	hc := HandlerContext{
-		Env:    &overlayEnviron{parent: r.writeEnv},
-		Dir:    r.Dir,
-		Stdout: r.stdout,
-		Stderr: r.stderr,
-	}
-	if r.stdin != nil { // do not leave hc.Stdin as a typed nil
-		hc.Stdin = r.stdin
-	}
-	return context.WithValue(ctx, handlerCtxKey{}, hc)
-}
-
 func (r *Runner) setFatalErr(err error) {
 	if r.fatalErr == nil {
 		r.fatalErr = err
@@ -325,6 +225,7 @@ func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
 	for _, rd := range st.Redirs {
 		cls, err := r.redir(ctx, rd)
 		if err != nil {
+			r.setFatalErr(err)
 			r.exit = 1
 			break
 		}
@@ -374,7 +275,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 		// Use a new slice, to not modify the slice in the alias map.
 		var args []*syntax.Word
 		left := cm.Args
-		for len(left) > 0 && r.opts[optExpandAliases] {
+		for len(left) > 0 {
 			als, ok := r.alias[left[0].Lit()]
 			if !ok {
 				break
@@ -646,7 +547,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			}
 		}
 	case *syntax.TestClause:
-		if r.bashTest(ctx, cm.X, false) == "" && r.exit == 0 {
+		if r.shTest(ctx, cm.X) == "" && r.exit == 0 {
 			// to preserve exit status code 2 for regex errors, etc
 			r.exit = 1
 		}
@@ -902,7 +803,7 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "2":
 			orig = &r.stderr
 		default:
-			panic(fmt.Sprintf("unsupported redirect fd: %v", rd.N.Value))
+			return nil, fmt.Errorf("unsupported redirect fd: %v", rd.N.Value)
 		}
 	}
 	arg := r.literal(rd.Word)
@@ -930,7 +831,7 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "-":
 			*orig = io.Discard // closing the output writer
 		default:
-			panic(fmt.Sprintf("unhandled %v arg: %q", rd.Op, arg))
+			r.errf("unhandled %v arg: %q", rd.Op, arg)
 		}
 		return nil, nil
 	case syntax.RdrIn, syntax.RdrOut, syntax.AppOut,
@@ -941,11 +842,11 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "-":
 			r.stdin = nil // closing the input file
 		default:
-			panic(fmt.Sprintf("unhandled %v arg: %q", rd.Op, arg))
+			return nil, fmt.Errorf("unhandled %v arg: %q", rd.Op, arg)
 		}
 		return nil, nil
 	default:
-		panic(fmt.Sprintf("unhandled redirect op: %v", rd.Op))
+		return nil, fmt.Errorf("unhandled redirect op: %v", rd.Op)
 	}
 	mode := os.O_RDONLY
 	switch rd.Op {
@@ -954,7 +855,7 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 	case syntax.RdrOut, syntax.RdrAll:
 		mode = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	}
-	f, err := r.open(ctx, arg, mode, 0o644, true)
+	f, err := r.openFile(ctx, arg, mode, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -998,15 +899,7 @@ func (r *Runner) call(ctx context.Context, pos syntax.Pos, args []string) {
 	if r.stop(ctx) {
 		return
 	}
-	if r.callHandler != nil {
-		var err error
-		args, err = r.callHandler(r.handlerCtx(ctx), args)
-		if err != nil {
-			// handler's custom fatal error
-			r.setFatalErr(err)
-			return
-		}
-	}
+
 	name := args[0]
 	if body := r.Funcs[name]; body != nil {
 		// stack them to support nested func calls
@@ -1037,7 +930,27 @@ func (r *Runner) call(ctx context.Context, pos syntax.Pos, args []string) {
 }
 
 func (r *Runner) exec(ctx context.Context, args []string) {
-	err := r.execHandler(r.handlerCtx(ctx), args)
+	fun, ok := r.Commands[args[0]]
+	if !ok {
+		r.errf("sh: %s: command not found\n", args[0])
+		return
+	}
+
+	hc := RunnerContext{
+		Context:   ctx,
+		Env:       &overlayEnviron{parent: r.writeEnv},
+		FileSytem: r.FileSystem,
+		TTY:       r.TTY,
+		Dir:       r.Dir,
+		Stdout:    r.stdout,
+		Stderr:    r.stderr,
+		Command:   r.exec,
+	}
+	if r.stdin != nil { // do not leave hc.Stdin as a typed nil
+		hc.Stdin = r.stdin
+	}
+
+	err := fun(hc, args[1:])
 	if err != nil {
 		var es ExitStatus
 		if errors.As(err, &es) {
@@ -1053,41 +966,20 @@ func (r *Runner) exec(ctx context.Context, args []string) {
 	}
 }
 
-func (r *Runner) open(ctx context.Context, path string, flags int, mode os.FileMode, print bool) (io.ReadWriteCloser, error) {
-	// If we are opening a FIFO temporary file created by the interpreter itself,
-	// don't pass this along to the open handler as it will not work at all
-	// unless [os.OpenFile] is used directly with it.
-	// Matching by directory and basename prefix isn't perfect, but works.
-	//
-	// If we want FIFOs to use a handler in the future, they probably
-	// need their own separate handler API matching Unix-like semantics.
-	dir, name := filepath.Split(path)
-	dir = strings.TrimSuffix(dir, "/")
-	if dir == r.tempDir && strings.HasPrefix(name, fifoNamePrefix) {
-		return os.OpenFile(path, flags, mode)
-	}
-
-	f, err := r.openHandler(r.handlerCtx(ctx), path, flags, mode)
-	// TODO: support wrapped PathError returned from openHandler.
-	switch err.(type) {
-	case nil:
-		return f, nil
-	case *os.PathError:
-		if print {
-			r.errf("%v\n", err)
-		}
-	default: // handler's custom fatal error
-		r.setFatalErr(err)
-	}
-	return nil, err
+func (r *Runner) open(ctx context.Context, path string) (iofs.File, error) {
+	return r.FileSystem.Open(path)
 }
 
-func (r *Runner) stat(ctx context.Context, name string) (fs.FileInfo, error) {
-	path := absPath(r.Dir, name)
-	return r.statHandler(ctx, path, true)
+func (r *Runner) openFile(ctx context.Context, path string, flags int, mode iofs.FileMode) (fs.FileWriter, error) {
+	return r.FileSystem.OpenFile(path, flags, mode)
 }
 
-func (r *Runner) lstat(ctx context.Context, name string) (fs.FileInfo, error) {
-	path := absPath(r.Dir, name)
-	return r.statHandler(ctx, path, false)
+func (r *Runner) stat(ctx context.Context, name string) (iofs.FileInfo, error) {
+	path := r.absPath(name)
+	return r.FileSystem.Stat(path)
+}
+
+func (r *Runner) lstat(ctx context.Context, name string) (iofs.FileInfo, error) {
+	path := r.absPath(name)
+	return r.FileSystem.Lstat(path)
 }

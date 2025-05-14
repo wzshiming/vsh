@@ -1,6 +1,3 @@
-// Copyright (c) 2018, Daniel Martí <mvdan@mvdan.cc>
-// See LICENSE for licensing information
-
 package main
 
 import (
@@ -10,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/go-quicktest/qt"
-	"mvdan.cc/sh/v3/interp"
+	"github.com/wzshiming/vsh"
 )
 
 // Each test has an even number of strings, which form input-output pairs for
@@ -143,11 +140,9 @@ var interactiveTests = []struct {
 	},
 	{
 		pairs: []string{
-			"echo *; :\n",
+			"echo *; true\n",
 			"main.go main_test.go\n$ ",
 			"echo *\n",
-			"main.go main_test.go\n$ ",
-			"shopt -s globstar; echo **\n",
 			"main.go main_test.go\n$ ",
 		},
 	},
@@ -178,7 +173,7 @@ var interactiveTests = []struct {
 	{
 		pairs: []string{
 			"gosh_alias arg || true\n",
-			"\"gosh_alias\": executable file not found in $PATH\n$ ",
+			"sh: gosh_alias: command not found\n$ ",
 			"alias gosh_alias=echo\n",
 			"$ ",
 			"gosh_alias arg || true\n",
@@ -186,7 +181,7 @@ var interactiveTests = []struct {
 			"unalias gosh_alias\n",
 			"$ ",
 			"gosh_alias arg || true\n",
-			"\"gosh_alias\": executable file not found in $PATH\n$ ",
+			"sh: gosh_alias: command not found\n$ ",
 		},
 	},
 }
@@ -199,7 +194,10 @@ func TestInteractive(t *testing.T) {
 			qt.Assert(t, qt.IsNil(err))
 			outReader, outWriter, err := os.Pipe()
 			qt.Assert(t, qt.IsNil(err))
-			runner, _ := interp.New(interp.Interactive(true), interp.StdIO(inReader, outWriter, outWriter))
+			runner, err := vsh.NewRunner(vsh.WithStdIO(inReader, outWriter, outWriter))
+			if err != nil {
+				t.Fatal(err)
+			}
 			errc := make(chan error, 1)
 			go func() {
 				errc <- runInteractive(runner, inReader, outWriter, outWriter)
@@ -208,8 +206,8 @@ func TestInteractive(t *testing.T) {
 				inReader.Close()
 				outWriter.Close()
 			}()
-
-			if err := readString(outReader, "$ "); err != nil {
+			err = readString(outReader, "$ ")
+			if err != nil {
 				t.Fatal(err)
 			}
 
@@ -254,7 +252,7 @@ func TestInteractiveExit(t *testing.T) {
 		inWriter.Close()
 	}()
 	w := io.Discard
-	runner, _ := interp.New(interp.Interactive(true), interp.StdIO(inReader, w, w))
+	runner, _ := vsh.NewRunner(vsh.WithStdIO(inReader, w, w))
 	if err := runInteractive(runner, inReader, w, w); err != nil {
 		t.Fatal("expected a nil error")
 	}

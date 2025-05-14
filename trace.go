@@ -1,4 +1,4 @@
-package interp
+package vsh
 
 import (
 	"bytes"
